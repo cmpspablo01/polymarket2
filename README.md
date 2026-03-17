@@ -44,7 +44,7 @@ python main.py
 
 ## Logique de la stratégie
 
-1. **Fetch BTC** depuis Binance + Coinbase (chaque seconde)
+1. **Stream BTC** depuis Binance + Coinbase via WebSocket, puis échantillonnage toutes les `TICK_SAMPLE_SECONDS` secondes
 2. **Détection momentum** : N ticks consécutifs dans la même direction + changement % minimum
 3. **Signal** → BUY YES (BTC monte) ou BUY NO (BTC descend)
 4. **Exécution** : ordre FOK avec retries, gardé par max slippage + prix plafond
@@ -76,7 +76,8 @@ python main.py
 | Paramètre | Défaut | Description |
 |-----------|--------|-------------|
 | `MOMENTUM_TICKS` | 4 | Ticks consécutifs pour trigger |
-| `MOMENTUM_MIN_CHANGE_PCT` | 0.03 | Changement % minimum |
+| `MOMENTUM_MIN_CHANGE_PCT` | 0.002 | Changement % minimum en paper (mettre `0.03` pour des bougies 1 minute) |
+| `TICK_SAMPLE_SECONDS` | 1 | Intervalle d'échantillonnage des ticks pour le signal (`60` pour du live style 1 minute) |
 | `TRADE_SIZE_USD` | 5.0 | Taille par trade |
 | `MAX_BUY_PRICE` | 0.65 | Prix max d'achat |
 | `MAX_SLIPPAGE_BPS` | 300 | Slippage max (basis points) |

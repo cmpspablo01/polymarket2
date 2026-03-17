@@ -41,8 +41,6 @@ from .signal_engine import SignalEngine
 class TradingBot:
     """Main trading bot orchestrator."""
 
-    # How often to poll BTC prices (seconds)
-    TICK_INTERVAL = 1.0
     # How often to discover new markets (seconds)
     MARKET_SCAN_INTERVAL = 60.0
     # How often to print the performance report (seconds)
@@ -70,6 +68,8 @@ class TradingBot:
         self._pending_signals: dict[str, tuple[Signal, MarketInfo]] = {}
         self._last_market_scan: float = 0.0
         self._last_report: float = 0.0
+        self._last_signal_time: dict[str, float] = {}  # market_id → last signal timestamp
+        self._signal_cooldown: float = 30.0  # seconds between signals on same market
 
     def _init_clob_client(self):
         """Initialize Polymarket CLOB client with authentication."""
@@ -128,26 +128,26 @@ class TradingBot:
         self._running = False
         logger.info("Shutting down...")
         self.metrics.print_report()
-        await self.data.stop()
+        try:
+            await self.data.stop()
+        except BaseException:
+            pass
         logger.info("Bot stopped")
 
     async def _main_loop(self):
-        """Core event loop."""
-        logger.info("Entering main loop...")
+        """Core event loop — event-driven via WebSocket ticks."""
+        logger.info("Entering main loop (WebSocket event-driven)...")
 
         while self._running:
             try:
-                loop_start = time.time()
-
                 # 1. Discover markets periodically
                 if time.time() - self._last_market_scan > self.MARKET_SCAN_INTERVAL:
                     await self._scan_markets()
 
-                # 2. Fetch BTC prices
-                ticks = await self.data.fetch_btc_prices()
-                if not ticks:
-                    logger.debug("No BTC ticks received, waiting...")
-                    await asyncio.sleep(self.TICK_INTERVAL)
+                # 2. Wait for next BTC tick from WebSocket (replaces polling sleep)
+                got_tick = await self.data.wait_for_tick(timeout=2.0)
+                if not got_tick:
+                    logger.debug("No BTC tick in 2s — WebSocket reconnecting?")
                     continue
 
                 btc_price = self.data.latest_btc_price()
@@ -159,7 +159,6 @@ class TradingBot:
                 if not markets:
                     logger.debug("No active markets, scanning...")
                     self._last_market_scan = 0  # force rescan
-                    await asyncio.sleep(self.TICK_INTERVAL)
                     continue
 
                 # 4. For each active market, evaluate signals
@@ -177,11 +176,6 @@ class TradingBot:
                 if time.time() - self._last_report > self.REPORT_INTERVAL:
                     self.metrics.print_report()
                     self._last_report = time.time()
-
-                # Rate limit
-                elapsed = time.time() - loop_start
-                sleep_time = max(0, self.TICK_INTERVAL - elapsed)
-                await asyncio.sleep(sleep_time)
 
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
@@ -216,15 +210,24 @@ class TradingBot:
 
     async def _process_market(self, market: MarketInfo):
         """Evaluate and potentially trade on a single market."""
+        now = time.time()
+
         # Don't trade if too close to end
-        seconds_left = market.end_time - time.time()
+        seconds_left = market.end_time - now
         if seconds_left < self.cfg.strategy.market_end_buffer_seconds:
+            return
+
+        # Cooldown: don't spam signals on the same market
+        last_sig = self._last_signal_time.get(market.condition_id, 0.0)
+        if now - last_sig < self._signal_cooldown:
             return
 
         # Check for momentum signal
         signal = self.signals.evaluate(market)
         if signal is None:
             return
+
+        self._last_signal_time[market.condition_id] = now
 
         # Risk check
         allowed, reason = self.risk.check(signal)
@@ -248,6 +251,17 @@ class TradingBot:
                 f"Signal {signal.signal_id} failed: {attempt.reason}"
             )
             self._pending_signals[signal.signal_id] = (signal, market)
+            # Record immediately as failed (not executed) for metrics visibility
+            from .models import TradeOutcome, TradeResult
+            outcome = TradeOutcome(
+                signal_id=signal.signal_id,
+                market_id=market.condition_id,
+                side=signal.side,
+                executed=False,
+                result_theoretical=TradeResult.PENDING,
+                theoretical_entry_price=signal.theoretical_entry_price,
+            )
+            self.metrics.record(outcome)
 
     async def _manage_positions(self, markets: list[MarketInfo]):
         """

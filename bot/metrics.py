@@ -18,16 +18,18 @@ class MetricsEngine:
     """Aggregates and displays trading metrics, real vs theoretical."""
 
     def __init__(self):
-        self.all_signals: list[TradeOutcome] = []
+        self.all_signals: dict[str, TradeOutcome] = {}
         self.start_time: float = time.time()
 
     def record(self, outcome: TradeOutcome):
-        self.all_signals.append(outcome)
+        signal_id = outcome.signal_id or f"anon_{len(self.all_signals)}"
+        self.all_signals[signal_id] = outcome
 
     def compute(self) -> dict:
         """Compute all metrics."""
-        executed = [o for o in self.all_signals if o.executed]
-        theoretical = self.all_signals  # all signals count
+        outcomes = list(self.all_signals.values())
+        executed = [o for o in outcomes if o.executed]
+        theoretical = outcomes  # all signals count
 
         real_wins = sum(1 for o in executed if o.result_real == TradeResult.WIN)
         real_losses = sum(1 for o in executed if o.result_real == TradeResult.LOSS)
@@ -90,25 +92,21 @@ class MetricsEngine:
         pending_str = f" ({m['pending']} pending)" if m["pending"] > 0 else ""
 
         report = f"""
-  ══════════════════════════════
   REAL P&L (Executed Orders)
-  ──────────────────────────────
+  --------------------------
   Executed Trades: {m['executed_trades']}
   Wins / Losses:   {m['real_wins']} / {m['real_losses']}
   Win Rate:        {m['real_win_rate']:.1f}%
   Real P&L:        ${m['real_pnl']:+.2f}
 
   THEORETICAL (All Signals)
-  ──────────────────────────────
+  -------------------------
   Total Signals:   {m['total_signals']}{pending_str}
   Failed Orders:   {m['failed_orders']}
   Wins / Losses:   {m['theo_wins']} / {m['theo_losses']}
   Win Rate:        {m['theo_win_rate']:.1f}%
   Theoretical P&L: ${m['theo_pnl']:+.2f}
   Avg per Trade:   ${m['avg_per_trade']:+.2f}
-
-  Uptime:          {m['uptime_hours']:.1f}h
-  ══════════════════════════════
 """
         logger.info(report)
         return m

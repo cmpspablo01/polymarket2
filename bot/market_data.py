@@ -2,7 +2,7 @@
 market_data.py — MarketDataEngine
 
 Responsibilities:
- 1. Fetch BTC price from Binance + Coinbase via ccxt (public, no keys).
+ 1. Stream real-time BTC prices from Binance + Coinbase via WebSocket (<100ms latency).
  2. Discover active BTC up/down markets on Polymarket via CLOB client.
  3. Fetch Polymarket orderbook / midpoint for active markets.
  4. Maintain a rolling window of BTC price ticks for momentum detection.
@@ -10,11 +10,12 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections import deque
 from typing import Optional
 
-import ccxt.async_support as ccxt
+import websockets
 from loguru import logger
 
 from py_clob_client.client import ClobClient
@@ -24,60 +25,163 @@ from .models import MarketInfo, PriceTick
 
 
 class MarketDataEngine:
-    """Provides real-time BTC prices and Polymarket market data."""
+    """Provides real-time BTC prices via WebSocket and Polymarket market data."""
 
-    # Rolling window size (number of ticks kept)
     MAX_TICKS = 200
+
+    # Binance aggTrade: every single trade on the order book, ~10-50ms latency
+    _WS_BINANCE = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
+    # Coinbase Exchange (stable public endpoint, no auth required)
+    _WS_COINBASE = "wss://ws-feed.exchange.coinbase.com"
 
     def __init__(self, cfg: BotConfig, clob_client: Optional[ClobClient] = None):
         self.cfg = cfg
         self.clob = clob_client
         self.ticks: deque[PriceTick] = deque(maxlen=self.MAX_TICKS)
-        self._binance: Optional[ccxt.binance] = None
-        self._coinbase: Optional[ccxt.coinbase] = None
+        # Signal ticks — one sample per second, used by SignalEngine for momentum
+        self.signal_ticks: deque[PriceTick] = deque(maxlen=self.MAX_TICKS)
         self._active_markets: dict[str, MarketInfo] = {}
+        self._ws_running = False
+        self._ws_tasks: list[asyncio.Task] = []
+        self._tick_event: asyncio.Event = asyncio.Event()
 
     # ── lifecycle ─────────────────────────────────────────────────────
 
     async def start(self):
-        self._binance = ccxt.binance({"enableRateLimit": True})
-        self._coinbase = ccxt.coinbase({"enableRateLimit": True})
-        logger.info("MarketDataEngine started")
+        self._ws_running = True
+        self._ws_tasks = [
+            asyncio.create_task(self._binance_ws_loop(), name="ws-binance"),
+            asyncio.create_task(self._coinbase_ws_loop(), name="ws-coinbase"),
+            asyncio.create_task(self._sampler_loop(), name="ws-sampler"),
+        ]
+        logger.info("MarketDataEngine started (WebSocket mode — Binance + Coinbase)")
 
     async def stop(self):
-        for ex in (self._binance, self._coinbase):
-            if ex:
-                await ex.close()
+        self._ws_running = False
+        for task in self._ws_tasks:
+            task.cancel()
+        # return_exceptions=True suppresses CancelledError propagation
+        results = await asyncio.gather(*self._ws_tasks, return_exceptions=True)
+        self._ws_tasks.clear()
         logger.info("MarketDataEngine stopped")
 
-    # ── BTC price fetching ────────────────────────────────────────────
+    # ── WebSocket loops ───────────────────────────────────────────────
 
-    async def fetch_btc_prices(self) -> list[PriceTick]:
-        """Fetch latest BTC price from Binance and Coinbase concurrently."""
-        ticks: list[PriceTick] = []
-
-        async def _fetch(exchange, source: str, symbol: str):
-            try:
-                ticker = await exchange.fetch_ticker(symbol)
-                t = PriceTick(
-                    source=source,
-                    symbol=symbol,
-                    price=float(ticker["last"]),
+    async def _sampler_loop(self):
+        """
+        Sample BTC price at a fixed interval into signal_ticks.
+        Paper/test default: 1s — fires frequently for quick feedback.
+        Live production: set TICK_SAMPLE_SECONDS=60 (1-minute bars, like Kiro).
+        """
+        interval = self.cfg.strategy.tick_sample_seconds
+        while self._ws_running:
+            await asyncio.sleep(interval)
+            price = self.latest_btc_price()
+            if price is not None:
+                self.signal_ticks.append(PriceTick(
+                    source="sampled",
+                    symbol="BTC/USDT",
+                    price=price,
                     timestamp=time.time(),
-                )
-                ticks.append(t)
+                ))
+
+    async def _binance_ws_loop(self):
+        """Stream Binance aggTrade ticks. Reconnects with exponential backoff."""
+        backoff = 1.0
+        while self._ws_running:
+            try:
+                async with websockets.connect(
+                    self._WS_BINANCE,
+                    ping_interval=20,
+                    ping_timeout=10,
+                ) as ws:
+                    logger.info("Binance WebSocket connected")
+                    backoff = 1.0
+                    async for raw in ws:
+                        if not self._ws_running:
+                            return
+                        msg = json.loads(raw)
+                        self.ticks.append(PriceTick(
+                            source="binance",
+                            symbol="BTC/USDT",
+                            price=float(msg["p"]),
+                            timestamp=time.time(),
+                        ))
+                        self._tick_event.set()
+            except asyncio.CancelledError:
+                return
             except Exception as e:
-                logger.warning(f"Failed to fetch {source}: {e}")
+                if not self._ws_running:
+                    return
+                logger.warning(f"Binance WS ({type(e).__name__}): {e} — retry in {backoff:.0f}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
 
-        await asyncio.gather(
-            _fetch(self._binance, "binance", "BTC/USDT"),
-            _fetch(self._coinbase, "coinbase", "BTC/USD"),
-        )
+    async def _coinbase_ws_loop(self):
+        """Stream Coinbase ticker ticks. Reconnects with exponential backoff."""
+        subscribe = json.dumps({
+            "type": "subscribe",
+            "product_ids": ["BTC-USD"],
+            "channels": ["ticker"],
+        })
+        backoff = 1.0
+        while self._ws_running:
+            try:
+                async with websockets.connect(
+                    self._WS_COINBASE,
+                    ping_interval=20,
+                    ping_timeout=10,
+                ) as ws:
+                    await ws.send(subscribe)
+                    logger.info("Coinbase WebSocket connected")
+                    backoff = 1.0
+                    async for raw in ws:
+                        if not self._ws_running:
+                            return
+                        msg = json.loads(raw)
+                        # Coinbase Exchange ticker message has 'price' at top level
+                        if msg.get("type") == "ticker" and msg.get("price"):
+                            self.ticks.append(PriceTick(
+                                source="coinbase",
+                                symbol="BTC/USD",
+                                price=float(msg["price"]),
+                                timestamp=time.time(),
+                            ))
+                            self._tick_event.set()
+                        for event in msg.get("events", []):
+                            for ticker in event.get("tickers", []):
+                                price_str = ticker.get("price")
+                                if price_str:
+                                    self.ticks.append(PriceTick(
+                                        source="coinbase",
+                                        symbol="BTC/USD",
+                                        price=float(price_str),
+                                        timestamp=time.time(),
+                                    ))
+                                    self._tick_event.set()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                if not self._ws_running:
+                    return
+                logger.warning(f"Coinbase WS ({type(e).__name__}): {e} — retry in {backoff:.0f}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
 
-        for t in ticks:
-            self.ticks.append(t)
+    # ── tick access ───────────────────────────────────────────────────
 
-        return ticks
+    async def wait_for_tick(self, timeout: float = 2.0) -> bool:
+        """
+        Event-driven replacement for polling sleep.
+        Blocks until a new tick arrives from either WebSocket, or timeout.
+        Returns True if a tick arrived, False on timeout.
+        """
+        self._tick_event.clear()
+        try:
+            await asyncio.wait_for(self._tick_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     def latest_btc_price(self) -> Optional[float]:
         """Return the most recent BTC price across all sources."""
@@ -86,8 +190,12 @@ class MarketDataEngine:
         return self.ticks[-1].price
 
     def recent_ticks(self, n: int = 20) -> list[PriceTick]:
-        """Return the last n ticks."""
-        return list(self.ticks)[-n:]
+        """
+        Return the last n 1-second sampled ticks (used by SignalEngine).
+        Each entry represents the BTC price at the end of a 1-second window,
+        making momentum detection equivalent to evaluating on 1s bars.
+        """
+        return list(self.signal_ticks)[-n:]
 
     # ── Polymarket markets ────────────────────────────────────────────
 
@@ -170,10 +278,36 @@ class MarketDataEngine:
             del self._active_markets[k]
         return list(self._active_markets.values())
 
+    # ── paper price simulation ────────────────────────────────────────
+
+    def _paper_price(self, token_id: str) -> float:
+        """
+        Simulate a Polymarket YES/NO token price for paper trading.
+        Base: 0.50 (max-entropy market).
+        Adjusted ±0.06 based on recent BTC momentum so execution
+        prices feel realistic and vary with market conditions.
+        """
+        ticks = self.recent_ticks(6)
+        if len(ticks) < 2:
+            return 0.50
+
+        ups = sum(1 for i in range(1, len(ticks)) if ticks[i].price > ticks[i - 1].price)
+        downs = len(ticks) - 1 - ups
+        bias = (ups - downs) / max(len(ticks) - 1, 1)  # -1.0 … +1.0
+
+        # YES tokens appreciate when BTC goes up, NO tokens when BTC goes down
+        is_no = "no" in token_id.lower()
+        direction = -bias if is_no else bias
+
+        price = 0.50 + direction * 0.06
+        return round(min(0.64, max(0.36, price)), 3)  # always below MAX_BUY_PRICE
+
+    # ── Polymarket orderbook ──────────────────────────────────────────
+
     def get_midpoint(self, token_id: str) -> Optional[float]:
         """Get midpoint price for a token on Polymarket."""
         if self.clob is None:
-            return None
+            return self._paper_price(token_id)
         try:
             mid = self.clob.get_midpoint(token_id)
             return float(mid) if mid else None
@@ -184,7 +318,8 @@ class MarketDataEngine:
     def get_best_ask(self, token_id: str) -> Optional[float]:
         """Get best ask (lowest sell price) for a token."""
         if self.clob is None:
-            return None
+            # Paper: half-cent spread (realistic for active Polymarket BTC markets)
+            return round(self._paper_price(token_id) + 0.005, 3)
         try:
             book = self.clob.get_order_book(token_id)
             asks = book.asks if hasattr(book, "asks") else []
@@ -197,7 +332,7 @@ class MarketDataEngine:
     def get_best_bid(self, token_id: str) -> Optional[float]:
         """Get best bid (highest buy price) for a token."""
         if self.clob is None:
-            return None
+            return round(self._paper_price(token_id) - 0.005, 3)
         try:
             book = self.clob.get_order_book(token_id)
             bids = book.bids if hasattr(book, "bids") else []
