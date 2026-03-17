@@ -129,3 +129,4 @@ class Position:
     cost_usd: float = 0.0
     open_ts: float = field(default_factory=time.time)
     signal_id: str = ""
+    end_time: float = 0.0      # market end timestamp

@@ -56,9 +56,14 @@ class ExecutionEngine:
 
         for attempt_idx in range(self.cfg.execution.fok_max_retries):
             # Re-fetch price before each attempt
-            current_price = self.data.get_best_ask(token_id)
-            if current_price is None:
+            # In paper mode, use midpoint (simulated fill at mid-market)
+            # In live mode, use best_ask (actual price we'd pay)
+            if self.cfg.paper_trading:
                 current_price = self.data.get_midpoint(token_id)
+            else:
+                current_price = self.data.get_best_ask(token_id)
+                if current_price is None:
+                    current_price = self.data.get_midpoint(token_id)
             if current_price is None:
                 best_attempt.reason = "could not fetch price"
                 logger.warning(f"Attempt {attempt_idx}: no price for {token_id}")

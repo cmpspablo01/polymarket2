@@ -55,6 +55,7 @@ class PortfolioEngine:
             size=attempt.filled_qty,
             cost_usd=attempt.avg_fill_price * attempt.filled_qty,
             signal_id=signal.signal_id,
+            end_time=market.end_time,
         )
         self.positions[signal.signal_id] = pos
         self.balance_usd -= pos.cost_usd

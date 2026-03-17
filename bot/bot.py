@@ -44,7 +44,7 @@ class TradingBot:
     # How often to discover new markets (seconds)
     MARKET_SCAN_INTERVAL = 60.0
     # How often to print the performance report (seconds)
-    REPORT_INTERVAL = 300.0
+    REPORT_INTERVAL = 60.0
 
     def __init__(self, cfg: BotConfig):
         self.cfg = cfg
@@ -174,6 +174,11 @@ class TradingBot:
 
                 # 7. Print report periodically
                 if time.time() - self._last_report > self.REPORT_INTERVAL:
+                    open_pos = len(self.portfolio.positions)
+                    if open_pos:
+                        for sid, p in self.portfolio.positions.items():
+                            secs = p.end_time - time.time()
+                            logger.info(f"  Open: {p.side.value} {p.market_id[:12]} | {secs:.0f}s left")
                     self.metrics.print_report()
                     self._last_report = time.time()
 
@@ -185,12 +190,26 @@ class TradingBot:
         """Discover active BTC up/down markets."""
         self._last_market_scan = time.time()
 
-        if self.cfg.paper_trading and self.clob_client is None:
-            # In pure paper mode without CLOB client, create a synthetic market
-            self._create_synthetic_market()
+        # Always try real market discovery first (REST API, no auth needed)
+        real_markets = await self.data.discover_btc_markets()
+
+        if real_markets:
+            # Check if any are currently active (started)
+            now = time.time()
+            active_now = [m for m in real_markets if m.start_time <= now]
+            if active_now:
+                return  # We have real active markets — use them
+
+            # All are future — also create synthetic so paper trading continues
+            if self.cfg.paper_trading:
+                self._create_synthetic_market()
             return
 
-        self.data.discover_btc_markets()
+        # No real markets found — create synthetic in paper mode
+        if self.cfg.paper_trading:
+            self._create_synthetic_market()
+        else:
+            logger.warning("No BTC markets found on Polymarket")
 
     def _create_synthetic_market(self):
         """Create a fake market for paper trading without API access."""
@@ -212,9 +231,17 @@ class TradingBot:
         """Evaluate and potentially trade on a single market."""
         now = time.time()
 
+        # Don't trade a market that hasn't started yet
+        if market.start_time and market.start_time > now:
+            return
+
         # Don't trade if too close to end
         seconds_left = market.end_time - now
         if seconds_left < self.cfg.strategy.market_end_buffer_seconds:
+            return
+
+        # Don't open a new position if we already have one on this market
+        if self.portfolio.positions_for_market(market.condition_id):
             return
 
         # Cooldown: don't spam signals on the same market
@@ -259,7 +286,7 @@ class TradingBot:
                 side=signal.side,
                 executed=False,
                 result_theoretical=TradeResult.PENDING,
-                theoretical_entry_price=signal.theoretical_entry_price,
+                entry_price=signal.theoretical_entry_price,
             )
             self.metrics.record(outcome)
 
@@ -275,23 +302,22 @@ class TradingBot:
 
         for signal_id, pos in list(self.portfolio.positions.items()):
             market = markets_by_id.get(pos.market_id)
-            if market is None:
-                continue
+            end_time = market.end_time if market else pos.end_time
+            seconds_left = end_time - now
 
-            seconds_left = market.end_time - now
-
-            # Force exit if close to end
+            # Force exit if close to end OR market already expired (orphaned)
             if seconds_left < self.cfg.strategy.force_exit_seconds:
                 logger.info(
                     f"Force exit: {seconds_left:.0f}s left for {signal_id}"
                 )
-                current_price = self.data.get_best_bid(pos.token_id)
-                if current_price is None:
-                    # If paper trading with synthetic tokens
-                    if self.cfg.paper_trading:
-                        btc_price = self.data.latest_btc_price()
-                        current_price = 0.55  # paper estimate
-                    else:
+                # Paper mode: use midpoint (real orderbooks have extreme spreads)
+                if self.cfg.paper_trading:
+                    current_price = self.data.get_midpoint(pos.token_id)
+                    if current_price is None:
+                        current_price = self._estimate_paper_price(pos)
+                else:
+                    current_price = self.data.get_best_bid(pos.token_id)
+                    if current_price is None:
                         continue
 
                 outcome = self.portfolio.close_position(signal_id, current_price)
@@ -301,11 +327,19 @@ class TradingBot:
                     self.metrics.record(outcome)
                 continue
 
+            if market is None:
+                continue
+
             # Check for profit lock opportunity
-            current_price = self.data.get_best_bid(pos.token_id)
-            if current_price is None and self.cfg.paper_trading:
-                # Paper: simulate price movement based on BTC momentum
-                current_price = self._estimate_paper_price(pos)
+            # Paper mode: use midpoint; live mode: use best_bid
+            if self.cfg.paper_trading:
+                current_price = self.data.get_midpoint(pos.token_id)
+                if current_price is None:
+                    current_price = self._estimate_paper_price(pos)
+            else:
+                current_price = self.data.get_best_bid(pos.token_id)
+            if current_price is None:
+                current_price = self._estimate_paper_price(pos) if self.cfg.paper_trading else None
 
             if current_price is not None:
                 unrealized_pnl = (current_price - pos.entry_price) * pos.size
@@ -367,7 +401,7 @@ class TradingBot:
             else:
                 won = not btc_went_up
 
-            # If position was executed, close it
+            # If position was executed, close it (if not already force-exited)
             pos = self.portfolio.get_position(sig_id)
             if pos:
                 outcome = self.portfolio.close_at_resolution(sig_id, won)
@@ -375,8 +409,8 @@ class TradingBot:
                     self.risk.position_closed()
                     self.risk.record_pnl(outcome.real_pnl)
                     self.metrics.record(outcome)
-            else:
-                # Record theoretical only
+            elif not any(o.signal_id == sig_id and o.executed for o in self.portfolio.outcomes):
+                # Record theoretical only (if not already closed by force-exit)
                 outcome = self.portfolio.record_theoretical(signal, market, won)
                 self.metrics.record(outcome)
 

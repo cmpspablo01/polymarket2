@@ -32,10 +32,10 @@ class StrategyConfig:
     tick_sample_seconds: int = int(os.getenv("TICK_SAMPLE_SECONDS", "1"))
     max_slippage_bps: int = int(os.getenv("MAX_SLIPPAGE_BPS", "300"))
     trade_size_usd: float = float(os.getenv("TRADE_SIZE_USD", "5.0"))
-    max_buy_price: float = float(os.getenv("MAX_BUY_PRICE", "0.65"))
-    min_sell_price: float = float(os.getenv("MIN_SELL_PRICE", "0.35"))
-    market_end_buffer_seconds: int = int(os.getenv("MARKET_END_BUFFER_SECONDS", "120"))
-    force_exit_seconds: int = int(os.getenv("FORCE_EXIT_SECONDS", "60"))
+    max_buy_price: float = float(os.getenv("MAX_BUY_PRICE", "0.95"))
+    min_sell_price: float = float(os.getenv("MIN_SELL_PRICE", "0.05"))
+    market_end_buffer_seconds: int = int(os.getenv("MARKET_END_BUFFER_SECONDS", "60"))
+    force_exit_seconds: int = int(os.getenv("FORCE_EXIT_SECONDS", "30"))
 
 
 @dataclass
