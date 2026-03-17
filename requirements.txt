@@ -1,0 +1,6 @@
+py-clob-client
+python-dotenv
+websockets
+aiohttp
+ccxt
+loguru
